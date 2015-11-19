@@ -24,6 +24,17 @@ type RedisAdapter struct {
 	docker_host string
 }
 
+type LogstashMessage struct {
+	Type       string `json:"type"`
+	Timestamp  string `json:"@timestamp"`
+	Sourcehost string `json:"host"`
+	//Message        string                 `json:"message"`
+	Data           map[string]interface{} `json:"data"`
+	DockerFields   DockerFields           `json:"docker"`
+	MarathonFields MarathonFields         `json:"marathon"`
+	// TODO environment, role, service..
+}
+
 type DockerFields struct {
 	Name       string `json:"name"`
 	CID        string `json:"cid"`
@@ -33,22 +44,10 @@ type DockerFields struct {
 	DockerHost string `json:"docker_host,omitempty"`
 }
 
-//MARATHON_APP_ID=/nene
-//MARATHON_APP_DOCKER_IMAGE=docker.strava.com/strava/nene-server:0.2
-//MARATHON_APP_VERSION=2015-11-18T23:31:02.730Z
-
 type MarathonFields struct {
-	Fake *string `json:"fake,omitempty"`
-	Id   *string `json:"id,omitempty"`
-}
-
-type LogstashMessage struct {
-	Timestamp      string                 `json:"@timestamp"`
-	Sourcehost     string                 `json:"host"`
-	Message        string                 `json:"message"`
-	Data           map[string]interface{} `json:"data"`
-	DockerFields   DockerFields           `json:"docker"`
-	MarathonFields MarathonFields         `json:"marathon"`
+	Fake    *string `json:"fake,omitempty"`
+	Id      *string `json:"id,omitempty"`
+	Version *string `json:"version,omitempty"`
 }
 
 func init() {
@@ -65,7 +64,7 @@ func NewRedisAdapter(route *router.Route) (router.LogAdapter, error) {
 
 	key := route.Options["key"]
 	if key == "" {
-		key = getopt("REDIS_KEY", "logspout")
+		key = getopt("REDIS_KEY", "logstash")
 	}
 
 	password := route.Options["password"]
@@ -109,6 +108,10 @@ func (a *RedisAdapter) Stream(logstream chan *router.Message) {
 
 	for m := range logstream {
 		msg := createLogstashMessage(m, a.docker_host)
+		if msg == nil {
+			continue
+		}
+
 		js, err := json.Marshal(msg)
 		if err != nil {
 			if !mute {
@@ -118,20 +121,7 @@ func (a *RedisAdapter) Stream(logstream chan *router.Message) {
 			continue
 		}
 
-		//log.Println("push", conn.Err())
 		_, err = conn.Do("RPUSH", a.key, js)
-		//log.Println("pushed")
-		if err != nil {
-			if !mute {
-				log.Println("redis: error on rpush (muting until restored):", err)
-				mute = true
-			}
-			continue
-		}
-
-		//log.Println("push", conn.Err())
-		_, err = conn.Do("PUBLISH", "marathon_test", js)
-		//log.Println("pushed")
 		if err != nil {
 			if !mute {
 				log.Println("redis: error on rpush (muting until restored):", err)
@@ -141,7 +131,7 @@ func (a *RedisAdapter) Stream(logstream chan *router.Message) {
 		}
 
 		mute = false
-		log.Println("ok", m)
+		log.Println("sent", m)
 	}
 }
 
@@ -195,45 +185,52 @@ func splitImage(image string) (string, string) {
 	return image, ""
 }
 
-func createLogstashMessage(m *router.Message, docker_host string) interface{} {
+func createLogstashMessage(m *router.Message, docker_host string) *LogstashMessage {
 	image_name, image_tag := splitImage(m.Container.Config.Image)
 	cid := m.Container.ID[0:12]
 	name := m.Container.Name[1:]
 	timestamp := m.Time.Format(time.RFC3339Nano)
 
-	log.Println(m.Container.Config.Env)
+	var data map[string]interface{}
+	json.Unmarshal([]byte(m.Data), &data)
 
-	var x map[string]interface{}
-	json.Unmarshal([]byte(m.Data), &x)
-
-	log.Println(x)
-
-	return LogstashMessage{
-		Message:    m.Data,
-		Data:       x,
-		Timestamp:  timestamp,
-		Sourcehost: m.Container.Config.Hostname,
-		DockerFields: DockerFields{
-			CID:        cid,
-			Name:       name,
-			Image:      image_name,
-			ImageTag:   image_tag,
-			Source:     m.Source,
-			DockerHost: docker_host,
-		},
-		MarathonFields: MarathonFields{
-			Id:   envValue("MARATHON_APP_ID", m.Container.Config.Env),
-			Fake: envValue("FAKE", m.Container.Config.Env),
-		},
+	// Only ship lines that are valid logback looking json
+	// TODO optional return type?
+	if data["@timestamp"] != nil {
+		//log.Println(data)
+		return &LogstashMessage{
+			Type: "docker-mesos",
+			//Message:    m.Data,
+			Data:       data,
+			Timestamp:  timestamp,
+			Sourcehost: m.Container.Config.Hostname,
+			DockerFields: DockerFields{
+				CID:        cid,
+				Name:       name,
+				Image:      image_name,
+				ImageTag:   image_tag,
+				Source:     m.Source,
+				DockerHost: docker_host,
+			},
+			MarathonFields: MarathonFields{
+				Id:      envValue("MARATHON_APP_ID", m.Container.Config.Env),
+				Version: envValue("MARATHON_APP_VERSION", m.Container.Config.Env),
+				Fake:    envValue("FAKE", m.Container.Config.Env),
+			},
+		}
+	} else {
+		return nil
 	}
 }
 
-func envValue(a string, list []string) *string {
+func envValue(target string, envVars []string) *string {
 	// TODO doesn't work with escaped =, lots of problems...
-	for _, b := range list {
-		s := strings.Split(b, "=")
-		if s[0] == a {
-			return &s[len(s)-1]
+	for _, envVar := range envVars {
+		s := strings.Split(envVar, "=")
+		name := s[0]
+		value := s[len(s)-1]
+		if name == target {
+			return &value
 		}
 	}
 	return nil
