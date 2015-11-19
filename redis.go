@@ -22,7 +22,6 @@ type RedisAdapter struct {
 	pool        *redis.Pool
 	key         string
 	docker_host string
-	use_v0      bool
 }
 
 type DockerFields struct {
@@ -34,22 +33,22 @@ type DockerFields struct {
 	DockerHost string `json:"docker_host,omitempty"`
 }
 
-type LogstashFields struct {
-	Docker DockerFields `json:"docker"`
+//MARATHON_APP_ID=/nene
+//MARATHON_APP_DOCKER_IMAGE=docker.strava.com/strava/nene-server:0.2
+//MARATHON_APP_VERSION=2015-11-18T23:31:02.730Z
+
+type MarathonFields struct {
+	Fake *string `json:"fake,omitempty"`
+	Id   *string `json:"id,omitempty"`
 }
 
-type LogstashMessageV0 struct {
-	Timestamp  string         `json:"@timestamp"`
-	Sourcehost string         `json:"@source_host"`
-	Message    string         `json:"@message"`
-	Fields     LogstashFields `json:"@fields"`
-}
-
-type LogstashMessageV1 struct {
-	Timestamp  string       `json:"@timestamp"`
-	Sourcehost string       `json:"host"`
-	Message    string       `json:"message"`
-	Fields     DockerFields `json:"docker"`
+type LogstashMessage struct {
+	Timestamp      string                 `json:"@timestamp"`
+	Sourcehost     string                 `json:"host"`
+	Message        string                 `json:"message"`
+	Data           map[string]interface{} `json:"data"`
+	DockerFields   DockerFields           `json:"docker"`
+	MarathonFields MarathonFields         `json:"marathon"`
 }
 
 func init() {
@@ -76,14 +75,9 @@ func NewRedisAdapter(route *router.Route) (router.LogAdapter, error) {
 
 	docker_host := getopt("REDIS_DOCKER_HOST", "")
 
-	use_v0 := route.Options["use_v0_layout"] != ""
-	if !use_v0 {
-		use_v0 = getopt("REDIS_USE_V0_LAYOUT", "") != ""
-	}
-
 	if os.Getenv("DEBUG") != "" {
-		log.Printf("Using Redis server '%s', password: %t, pushkey: '%s', v0 layout: %t\n",
-			address, password != "", key, use_v0)
+		log.Printf("Using Redis server '%s', password: %t, pushkey: '%s'\n",
+			address, password != "", key)
 	}
 
 	pool := newRedisConnectionPool(address, password)
@@ -104,18 +98,17 @@ func NewRedisAdapter(route *router.Route) (router.LogAdapter, error) {
 		pool:        pool,
 		key:         key,
 		docker_host: docker_host,
-		use_v0:      use_v0,
 	}, nil
 }
 
 func (a *RedisAdapter) Stream(logstream chan *router.Message) {
+	log.Println("start stream")
 	conn := a.pool.Get()
 	defer conn.Close()
-
 	mute := false
 
 	for m := range logstream {
-		msg := createLogstashMessage(m, a.docker_host, a.use_v0)
+		msg := createLogstashMessage(m, a.docker_host)
 		js, err := json.Marshal(msg)
 		if err != nil {
 			if !mute {
@@ -124,7 +117,10 @@ func (a *RedisAdapter) Stream(logstream chan *router.Message) {
 			}
 			continue
 		}
+
+		//log.Println("push", conn.Err())
 		_, err = conn.Do("RPUSH", a.key, js)
+		//log.Println("pushed")
 		if err != nil {
 			if !mute {
 				log.Println("redis: error on rpush (muting until restored):", err)
@@ -132,7 +128,10 @@ func (a *RedisAdapter) Stream(logstream chan *router.Message) {
 			}
 			continue
 		}
-		_, err = conn.Do("PUBLISH", "marathon_foo", js)
+
+		//log.Println("push", conn.Err())
+		_, err = conn.Do("PUBLISH", "marathon_test", js)
+		//log.Println("pushed")
 		if err != nil {
 			if !mute {
 				log.Println("redis: error on rpush (muting until restored):", err)
@@ -140,7 +139,9 @@ func (a *RedisAdapter) Stream(logstream chan *router.Message) {
 			}
 			continue
 		}
+
 		mute = false
+		log.Println("ok", m)
 	}
 }
 
@@ -162,9 +163,11 @@ func getopt(name, dfault string) string {
 
 func newRedisConnectionPool(server, password string) *redis.Pool {
 	return &redis.Pool{
-		MaxIdle:     3,
+		MaxIdle: 3,
+		//MaxActive:   50,
 		IdleTimeout: 240 * time.Second,
 		Dial: func() (redis.Conn, error) {
+			log.Println("redis dial!")
 			c, err := redis.Dial("tcp", server)
 			if err != nil {
 				return nil, err
@@ -192,35 +195,25 @@ func splitImage(image string) (string, string) {
 	return image, ""
 }
 
-func createLogstashMessage(m *router.Message, docker_host string, use_v0 bool) interface{} {
+func createLogstashMessage(m *router.Message, docker_host string) interface{} {
 	image_name, image_tag := splitImage(m.Container.Config.Image)
 	cid := m.Container.ID[0:12]
 	name := m.Container.Name[1:]
 	timestamp := m.Time.Format(time.RFC3339Nano)
 
-	if use_v0 {
-		return LogstashMessageV0{
-			Message:    m.Data,
-			Timestamp:  timestamp,
-			Sourcehost: m.Container.Config.Hostname,
-			Fields: LogstashFields{
-				Docker: DockerFields{
-					CID:        cid,
-					Name:       name,
-					Image:      image_name,
-					ImageTag:   image_tag,
-					Source:     m.Source,
-					DockerHost: docker_host,
-				},
-			},
-		}
-	}
+	log.Println(m.Container.Config.Env)
 
-	return LogstashMessageV1{
+	var x map[string]interface{}
+	json.Unmarshal([]byte(m.Data), &x)
+
+	log.Println(x)
+
+	return LogstashMessage{
 		Message:    m.Data,
+		Data:       x,
 		Timestamp:  timestamp,
 		Sourcehost: m.Container.Config.Hostname,
-		Fields: DockerFields{
+		DockerFields: DockerFields{
 			CID:        cid,
 			Name:       name,
 			Image:      image_name,
@@ -228,5 +221,20 @@ func createLogstashMessage(m *router.Message, docker_host string, use_v0 bool) i
 			Source:     m.Source,
 			DockerHost: docker_host,
 		},
+		MarathonFields: MarathonFields{
+			Id:   envValue("MARATHON_APP_ID", m.Container.Config.Env),
+			Fake: envValue("FAKE", m.Container.Config.Env),
+		},
 	}
+}
+
+func envValue(a string, list []string) *string {
+	// TODO doesn't work with escaped =, lots of problems...
+	for _, b := range list {
+		s := strings.Split(b, "=")
+		if s[0] == a {
+			return &s[len(s)-1]
+		}
+	}
+	return nil
 }
